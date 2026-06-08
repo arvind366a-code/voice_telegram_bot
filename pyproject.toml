@@ -1,0 +1,15 @@
+[project]
+name = "voice-telegram-bot"
+version = "0.1.0"
+description = "Telegram speech-analysis bot (Whisper transcription + metrics, reminders, Turso history)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=1.0.0",
+    "python-telegram-bot[job-queue]>=20.0",
+    "pydub",
+    "python-dotenv",
+    "requests",
+    "libsql-client",
+    "tzdata",
+]

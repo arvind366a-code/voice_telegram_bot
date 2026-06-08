@@ -1,0 +1,18 @@
+# Coolify deployment (Docker Compose). This is an outbound-only Telegram
+# long-polling worker — no published ports, no healthcheck endpoint.
+# Set the environment variables in the Coolify UI (they are injected here).
+services:
+  voice-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OWNER_USER_ID: ${OWNER_USER_ID}
+      REVIEWER_USER_ID: ${REVIEWER_USER_ID}
+      GROUP_CHAT_ID: ${GROUP_CHAT_ID}
+      TURSO_DATABASE_URL: ${TURSO_DATABASE_URL}
+      TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN}
+      TZ: Asia/Kolkata
