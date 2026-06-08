@@ -74,9 +74,36 @@ uv run bot.py
 ```
 Then add the bot to your group, send a voice note, and get your analysis.
 
+## Deploy on Coolify (Docker)
+
+This is an **outbound-only Telegram long-polling worker** — no published ports, no
+healthcheck. Files: `Dockerfile` and `docker-compose.yaml`.
+
+1. Push this repo to GitHub (or your Git provider).
+2. In Coolify: **New Resource → Docker Compose** (or Dockerfile), point it at the repo.
+3. Add these **environment variables** in the Coolify UI:
+   `TELEGRAM_BOT_TOKEN`, `OPENAI_API_KEY`, `OWNER_USER_ID`, `REVIEWER_USER_ID`,
+   `GROUP_CHAT_ID`, `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`.
+4. Deploy. Logs stream live (`PYTHONUNBUFFERED=1`).
+
+⚠️ **One poller per bot token.** Telegram allows only one `getUpdates` consumer at
+a time. Stop any locally-running `bot.py` before the Coolify instance goes live, or
+you'll get HTTP 409 conflicts.
+
+Build/run locally to test:
+```bash
+docker build -t voice-telegram-bot .
+docker run --rm --env-file .env voice-telegram-bot
+```
+
 ## Notes
 - **Reviewer**: set `REVIEWER_USER_ID` so a second person can read reports in the
   group. Their own voice notes are ignored — only the owner's are analyzed.
 - **Reminders** are posted to `GROUP_CHAT_ID`: 6 AM IST every day, plus 8 PM IST
   only when no voice note was recorded that day (timezone: `Asia/Kolkata`).
-- **`/stats`** (owner only) summarizes your last 10 analyses.
+- **`/stats`** (owner only) replies with a **progress graph** (WPM / clarity /
+  filler trends over time) plus a caption showing your **current & longest
+  streak**, **missed days** in the last 30 days, and running averages.
+- **Failure alerts**: the bot validates the OpenAI key at startup and flags it if
+  invalid/expired/out-of-quota, and a global error handler alerts you (in the
+  group, or your DM) on any other failure — including a failed metrics save.

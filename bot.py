@@ -10,6 +10,7 @@ Responsibilities (all side-effects live here, not in the pipeline):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -17,6 +18,7 @@ from datetime import time
 
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -26,9 +28,11 @@ from telegram.ext import (
     filters,
 )
 
+import charts
 import db
 from db import IST
 from pipeline import analyze_audio_file
+from transcribe import OpenAIAuthError, check_openai_key
 
 load_dotenv()
 
@@ -43,14 +47,35 @@ OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])
 _group = os.environ.get("GROUP_CHAT_ID")
 GROUP_CHAT_ID = int(_group) if _group else None
 
+# Where failure alerts go: the group if configured, otherwise the owner's DM.
+ALERT_CHAT_ID = GROUP_CHAT_ID if GROUP_CHAT_ID is not None else OWNER_USER_ID
+
+# Optional reviewer — tagged in reminders to nudge the owner.
+_reviewer = os.environ.get("REVIEWER_USER_ID")
+REVIEWER_USER_ID = int(_reviewer) if _reviewer else None
+_reviewer_mention = (
+    f'<a href="tg://user?id={REVIEWER_USER_ID}">Aardra</a>'
+    if REVIEWER_USER_ID
+    else "Aardra"
+)
+_REVIEWER_LINE = f"\n👀 {_reviewer_mention}, please remind Karneeshkar to do it!"
+
 REMINDER_MORNING = (
     "⏰ Good morning! Time for your daily speech practice. "
-    "Send a voice note and I'll analyze it. 🎙️"
+    "Send a voice note and I'll analyze it. 🎙️" + _REVIEWER_LINE
 )
 REMINDER_EVENING = (
     "🌙 You haven't done your speech practice today. "
-    "Send a voice note before the day ends! 🎙️"
+    "Send a voice note before the day ends! 🎙️" + _REVIEWER_LINE
 )
+
+
+async def _alert(bot, text: str) -> None:
+    """Best-effort failure alert to the owner (group if set, else owner DM)."""
+    try:
+        await bot.send_message(chat_id=ALERT_CHAT_ID, text=text)
+    except Exception:
+        logger.exception("Failed to deliver alert")
 
 
 # --------------------------------------------------------------------------- #
@@ -89,9 +114,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await db.save_analysis(
                     user.id, message.chat_id, result["analysis"], result["transcription"]
                 )
-            except Exception:  # persistence must never break the user-facing reply
+            except Exception as exc:  # persistence must never break the user-facing reply
                 logger.exception("Failed to persist analysis to Turso")
+                await _alert(context.bot, f"🚨 Saved the report but FAILED to store metrics: {exc}")
 
+    except OpenAIAuthError as exc:
+        logger.error("OpenAI auth failure: %s", exc)
+        await status.edit_text(
+            f"🚨 OpenAI key problem — analysis is down.\n{exc}\n\n"
+            "Update OPENAI_API_KEY and redeploy."
+        )
     except Exception as exc:
         logger.exception("Analysis failed")
         await status.edit_text(f"❌ Analysis failed: {exc}")
@@ -115,6 +147,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         stats = await db.get_stats(OWNER_USER_ID)
+        streaks = await db.get_streaks(OWNER_USER_ID)
+        history = await db.get_history(OWNER_USER_ID, 30)
     except Exception as exc:
         await message.reply_text(f"❌ Could not load stats: {exc}")
         return
@@ -123,31 +157,54 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("No analyses recorded yet. Send a voice note to start! 🎙️")
         return
 
+    caption = _format_stats_caption(stats, streaks)
+
+    # Send a single progress graph (needs at least 2 points for a trend).
+    if len(history) >= 2:
+        try:
+            png = charts.render_progress_chart(history)
+            await message.reply_photo(photo=png, caption=caption)
+            return
+        except Exception:
+            logger.exception("Failed to render progress chart; sending text only")
+
+    await message.reply_text(
+        caption + "\n\n(Send a couple more notes to unlock the trend graph 📈)"
+    )
+
+
+def _format_stats_caption(stats: dict, streaks: dict) -> str:
+    today_mark = "✅ done today" if streaks["done_today"] else "⬜ not yet today"
     lines = [
         "📈 Your Progress",
         "──────────────────",
-        f"Total notes: {stats['total']} (showing last {stats['window']})",
-        f"Span: {stats['first_date']} → {stats['last_date']}",
+        f"🔥 Current streak: {streaks['current_streak']} day(s) — {today_mark}",
+        f"🏆 Longest streak: {streaks['longest_streak']} day(s)",
+        f"🗓️ Span: {stats['first_date']} → {stats['last_date']} ({stats['total']} notes)",
+    ]
+    if streaks["missed_count"]:
+        shown = ", ".join(streaks["missed_days"][-5:])
+        extra = streaks["missed_count"] - 5
+        more = f" (+{extra} more)" if extra > 0 else ""
+        lines.append(f"⚠️ Missed {streaks['missed_count']} day(s) in last 30: {shown}{more}")
+    else:
+        lines.append("✅ No missed days in the last 30 days!")
+    lines += [
         "",
         f"Avg WPM: {stats['avg_wpm']:.0f}",
         f"Avg fillers: {stats['avg_filler_pct']:.1f}%",
         f"Avg clarity: {stats['avg_clarity']:.0f}/100",
-        "",
-        "Recent (newest first):",
     ]
-    for r in stats["recent"]:
-        lines.append(
-            f"  {r['date']}: {r['avg_wpm']:.0f}wpm, "
-            f"{r['filler_pct']:.1f}% fillers, clarity {r['clarity']:.0f}"
-        )
-    await message.reply_text("\n".join(lines))
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
 # Scheduled reminders
 # --------------------------------------------------------------------------- #
 async def remind_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=REMINDER_MORNING)
+    await context.bot.send_message(
+        chat_id=GROUP_CHAT_ID, text=REMINDER_MORNING, parse_mode=ParseMode.HTML
+    )
 
 
 async def remind_evening(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -157,12 +214,20 @@ async def remind_evening(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Could not check today's status; sending reminder anyway")
         done = False
     if not done:
-        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=REMINDER_EVENING)
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID, text=REMINDER_EVENING, parse_mode=ParseMode.HTML
+        )
 
 
 # --------------------------------------------------------------------------- #
 # Startup
 # --------------------------------------------------------------------------- #
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all: alert the owner on ANY otherwise-unhandled failure."""
+    logger.exception("Unhandled error", exc_info=context.error)
+    await _alert(context.bot, f"🚨 Bot error: {context.error}")
+
+
 async def _post_init(app: Application) -> None:
     if db.is_configured():
         await db.init_db()
@@ -170,12 +235,22 @@ async def _post_init(app: Application) -> None:
     else:
         logger.warning("TURSO_DATABASE_URL not set — history/stats disabled.")
 
+    # Validate the OpenAI key at startup so an expired/invalid key is flagged
+    # immediately on (re)deploy, not only when the first voice note arrives.
+    try:
+        await asyncio.to_thread(check_openai_key)
+        logger.info("OpenAI key validated.")
+    except OpenAIAuthError as exc:
+        logger.error("OpenAI key check failed: %s", exc)
+        await _alert(app.bot, f"🚨 Startup alert: {exc}\nUpdate OPENAI_API_KEY and redeploy.")
+
 
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_voice))
+    app.add_error_handler(error_handler)
 
     if GROUP_CHAT_ID is not None:
         app.job_queue.run_daily(remind_morning, time=time(6, 0, tzinfo=IST))

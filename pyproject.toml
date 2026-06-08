@@ -12,4 +12,5 @@ dependencies = [
     "requests",
     "libsql-client",
     "tzdata",
+    "matplotlib",
 ]

@@ -6,7 +6,42 @@ OpenAI SDK response shape.
 
 from __future__ import annotations
 
-from openai import OpenAI
+import os
+
+from openai import (
+    OpenAI,
+    AuthenticationError,
+    PermissionDeniedError,
+    RateLimitError,
+)
+
+
+class OpenAIAuthError(RuntimeError):
+    """Raised when the OpenAI key is missing, invalid, expired, or out of quota.
+
+    Distinct from generic RuntimeError so the bot can fire a dedicated alert.
+    """
+
+
+def check_openai_key() -> None:
+    """Validate the OpenAI key. Best-effort: only raises on a definitive
+    auth/quota failure, not on transient network errors.
+
+    Raises:
+        OpenAIAuthError: if the key is unset, invalid/expired, or out of quota.
+    """
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise OpenAIAuthError("OPENAI_API_KEY is not set.")
+    try:
+        OpenAI().models.list()
+    except (AuthenticationError, PermissionDeniedError) as exc:
+        raise OpenAIAuthError(f"OpenAI API key invalid or expired: {exc}") from exc
+    except RateLimitError as exc:
+        if "insufficient_quota" in str(exc).lower() or "quota" in str(exc).lower():
+            raise OpenAIAuthError(f"OpenAI quota exhausted / billing issue: {exc}") from exc
+        return  # transient rate limit — not a key problem
+    except Exception:
+        return  # network/transient — don't false-alarm at startup
 
 
 def transcribe(filepath: str) -> dict:
@@ -37,6 +72,12 @@ def transcribe(filepath: str) -> dict:
             )
     except FileNotFoundError:
         raise RuntimeError(f"Audio file not found: {filepath}")
+    except (AuthenticationError, PermissionDeniedError) as exc:
+        raise OpenAIAuthError(f"OpenAI API key invalid or expired: {exc}") from exc
+    except RateLimitError as exc:
+        if "insufficient_quota" in str(exc).lower() or "quota" in str(exc).lower():
+            raise OpenAIAuthError(f"OpenAI quota exhausted / billing issue: {exc}") from exc
+        raise RuntimeError(f"OpenAI rate limited — try again shortly: {exc}") from exc
     except Exception as exc:  # surface a clean, actionable error upstream
         raise RuntimeError(f"Whisper transcription failed: {exc}") from exc
 

@@ -6,7 +6,7 @@ Isolated here so the analysis pipeline stays pure. The bot is the only caller.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import libsql_client
@@ -157,4 +157,107 @@ async def get_stats(user_id: int, n: int = 10) -> dict | None:
         "avg_filler_pct": round(avg("filler_pct"), 1),
         "avg_clarity": round(avg("clarity"), 1),
         "recent": rows,
+    }
+
+
+async def get_history(user_id: int, limit: int = 30) -> list:
+    """Return the user's last ``limit`` analyses in chronological order (oldest
+    first) for plotting a progress graph."""
+    async with _client() as client:
+        rs = await client.execute(
+            """
+            SELECT created_at, created_date_ist, avg_wpm, filler_pct, clarity
+            FROM analyses
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            [user_id, limit],
+        )
+    rows = [
+        {
+            "created_at": r[0],
+            "date": r[1],
+            "avg_wpm": r[2] or 0.0,
+            "filler_pct": r[3] or 0.0,
+            "clarity": r[4] or 0.0,
+        }
+        for r in rs.rows
+    ]
+    rows.reverse()  # chronological
+    return rows
+
+
+async def get_streaks(user_id: int, lookback_days: int = 30) -> dict:
+    """Compute practice streaks and missed days from distinct practice dates (IST).
+
+    Returns:
+        {
+          "done_today": bool,
+          "current_streak": int,   # consecutive days up to today (or yesterday)
+          "longest_streak": int,
+          "missed_days": [iso, ...],   # days with no practice in the window
+          "missed_count": int,
+        }
+    """
+    async with _client() as client:
+        rs = await client.execute(
+            "SELECT DISTINCT created_date_ist FROM analyses WHERE user_id = ? ORDER BY created_date_ist",
+            [user_id],
+        )
+
+    days = set()
+    for r in rs.rows:
+        try:
+            days.add(date.fromisoformat(r[0]))
+        except (TypeError, ValueError):
+            continue
+
+    today = datetime.now(IST).date()
+    if not days:
+        return {
+            "done_today": False,
+            "current_streak": 0,
+            "longest_streak": 0,
+            "missed_days": [],
+            "missed_count": 0,
+        }
+
+    done_today = today in days
+
+    # Current streak: count back from today; if today isn't done yet, the streak
+    # is still "alive" if yesterday was done.
+    current = 0
+    cursor = today if done_today else today - timedelta(days=1)
+    while cursor in days:
+        current += 1
+        cursor -= timedelta(days=1)
+
+    # Longest streak across all history.
+    longest = 0
+    for d in days:
+        if (d - timedelta(days=1)) not in days:  # start of a run
+            run = 1
+            nxt = d + timedelta(days=1)
+            while nxt in days:
+                run += 1
+                nxt += timedelta(days=1)
+            longest = max(longest, run)
+
+    # Missed days within the lookback window (from the later of first-practice or
+    # window start, up to yesterday — today isn't "missed" until it ends).
+    window_start = max(min(days), today - timedelta(days=lookback_days))
+    missed = []
+    d = window_start
+    while d < today:
+        if d not in days:
+            missed.append(d.isoformat())
+        d += timedelta(days=1)
+
+    return {
+        "done_today": done_today,
+        "current_streak": current,
+        "longest_streak": longest,
+        "missed_days": missed,
+        "missed_count": len(missed),
     }
