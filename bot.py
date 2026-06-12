@@ -19,6 +19,7 @@ from datetime import time
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -335,7 +336,18 @@ async def remind_evening(context: ContextTypes.DEFAULT_TYPE) -> None:
 # Startup
 # --------------------------------------------------------------------------- #
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Catch-all: alert the owner on ANY otherwise-unhandled failure."""
+    """Catch-all: alert the owner on ANY otherwise-unhandled failure.
+
+    `Conflict` (another getUpdates poller on the same token) is logged but NOT
+    alerted: it's almost always a transient redeploy overlap that self-heals,
+    and the poller retries every few seconds — alerting would flood the group.
+    """
+    if isinstance(context.error, Conflict):
+        logger.warning(
+            "getUpdates conflict — another bot instance is polling this token. "
+            "Transient during redeploys; if it persists, a second instance is running."
+        )
+        return
     logger.exception("Unhandled error", exc_info=context.error)
     await _alert(context.bot, f"🚨 Bot error: {context.error}")
 
