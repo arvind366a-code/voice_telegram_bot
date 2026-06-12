@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Application source. README.md satisfies the readme declared in pyproject.toml.
 COPY README.md ./
-COPY transcribe.py analyze.py report.py pipeline.py db.py charts.py bot.py ./
+COPY transcribe.py analyze.py report.py pipeline.py diarize.py db.py charts.py bot.py ./
 
 # Secrets and runtime config come from the environment (Coolify env vars),
 # never from a baked-in .env.

@@ -17,11 +17,12 @@ import tempfile
 from datetime import time
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -31,7 +32,7 @@ from telegram.ext import (
 import charts
 import db
 from db import IST
-from pipeline import analyze_audio_file
+from pipeline import analyze_audio_file, analyze_call_file
 from transcribe import OpenAIAuthError, check_openai_key
 
 load_dotenv()
@@ -50,9 +51,12 @@ GROUP_CHAT_ID = int(_group) if _group else None
 # Where failure alerts go: the group if configured, otherwise the owner's DM.
 ALERT_CHAT_ID = GROUP_CHAT_ID if GROUP_CHAT_ID is not None else OWNER_USER_ID
 
-# Optional reviewer — tagged in reminders to nudge the owner.
+# Optional reviewer — tagged in reminders to nudge the owner. This is also "the
+# other person" (female) in call recordings and the only user allowed to press
+# the "Mark complete" button.
 _reviewer = os.environ.get("REVIEWER_USER_ID")
 REVIEWER_USER_ID = int(_reviewer) if _reviewer else None
+OTHER_USER_ID = REVIEWER_USER_ID
 _reviewer_mention = (
     f'<a href="tg://user?id={REVIEWER_USER_ID}">Aardra</a>'
     if REVIEWER_USER_ID
@@ -76,6 +80,15 @@ async def _alert(bot, text: str) -> None:
         await bot.send_message(chat_id=ALERT_CHAT_ID, text=text)
     except Exception:
         logger.exception("Failed to deliver alert")
+
+
+def _complete_keyboard() -> InlineKeyboardMarkup | None:
+    """The 'Mark complete' button — only useful when a reviewer is configured."""
+    if OTHER_USER_ID is None:
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Mark complete for today", callback_data="done")]]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -107,7 +120,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await tg_file.download_to_drive(tmp_path)
 
         result = analyze_audio_file(tmp_path)
-        await status.edit_text(result["report"])
+        await status.edit_text(result["report"], reply_markup=_complete_keyboard())
 
         if db.is_configured():
             try:
@@ -133,6 +146,99 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # --------------------------------------------------------------------------- #
+# Call-recording handler (audio files — 2 speakers, owner analyzed)
+# --------------------------------------------------------------------------- #
+async def handle_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return
+
+    # Access control: only the owner may submit call recordings.
+    if user.id != OWNER_USER_ID:
+        logger.info("Ignoring call recording from non-owner user %s", user.id)
+        return
+
+    media = message.audio or message.document
+    if media is None:
+        return
+
+    status = await message.reply_text("Analyzing call... 📞")
+
+    tmp_path = None
+    try:
+        tg_file = await media.get_file()
+        name = getattr(media, "file_name", None) or ""
+        suffix = os.path.splitext(name)[1] or ".mp3"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+        await tg_file.download_to_drive(tmp_path)
+
+        result = analyze_call_file(tmp_path)
+        await status.edit_text(result["report"], reply_markup=_complete_keyboard())
+
+        if db.is_configured():
+            try:
+                await db.save_analysis(
+                    user.id, message.chat_id, result["analysis"],
+                    result["transcription"], source="call",
+                )
+            except Exception as exc:  # persistence must never break the user-facing reply
+                logger.exception("Failed to persist call analysis to Turso")
+                await _alert(context.bot, f"🚨 Saved the report but FAILED to store metrics: {exc}")
+
+    except OpenAIAuthError as exc:
+        logger.error("OpenAI auth failure: %s", exc)
+        await status.edit_text(
+            f"🚨 OpenAI key problem — analysis is down.\n{exc}\n\n"
+            "Update OPENAI_API_KEY and redeploy."
+        )
+    except Exception as exc:
+        logger.exception("Call analysis failed")
+        await status.edit_text(f"❌ Call analysis failed: {exc}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# "Mark complete" button — only the other person (reviewer) may press it
+# --------------------------------------------------------------------------- #
+async def mark_complete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    if OTHER_USER_ID is None or query.from_user.id != OTHER_USER_ID:
+        await query.answer("Only Aardra can mark this complete 🙂", show_alert=True)
+        return
+
+    if not db.is_configured():
+        await query.answer("Storage unavailable — can't record completion.", show_alert=True)
+        return
+
+    try:
+        marked = await db.mark_today_complete(OWNER_USER_ID, OTHER_USER_ID)
+    except Exception:
+        logger.exception("Failed to mark today complete")
+        await query.answer("Something went wrong — try again.", show_alert=True)
+        return
+
+    if not marked:
+        await query.answer("No practice recorded yet today.", show_alert=True)
+        return
+
+    await query.answer("✅ Marked complete!")
+    done_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Completed for today", callback_data="noop")]]
+    )
+    try:
+        await query.edit_message_reply_markup(reply_markup=done_markup)
+    except Exception:
+        logger.exception("Failed to update button after completion")
+
+
+# --------------------------------------------------------------------------- #
 # /stats command (owner only)
 # --------------------------------------------------------------------------- #
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,6 +255,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         stats = await db.get_stats(OWNER_USER_ID)
         streaks = await db.get_streaks(OWNER_USER_ID)
         history = await db.get_history(OWNER_USER_ID, 30)
+        completion = await db.completion_status_today(OWNER_USER_ID)
     except Exception as exc:
         await message.reply_text(f"❌ Could not load stats: {exc}")
         return
@@ -157,7 +264,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("No analyses recorded yet. Send a voice note to start! 🎙️")
         return
 
-    caption = _format_stats_caption(stats, streaks)
+    caption = _format_stats_caption(stats, streaks, completion)
 
     # Send a single progress graph (needs at least 2 points for a trend).
     if len(history) >= 2:
@@ -173,7 +280,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-def _format_stats_caption(stats: dict, streaks: dict) -> str:
+def _format_stats_caption(stats: dict, streaks: dict, completion: dict | None = None) -> str:
     today_mark = "✅ done today" if streaks["done_today"] else "⬜ not yet today"
     lines = [
         "📈 Your Progress",
@@ -182,6 +289,11 @@ def _format_stats_caption(stats: dict, streaks: dict) -> str:
         f"🏆 Longest streak: {streaks['longest_streak']} day(s)",
         f"🗓️ Span: {stats['first_date']} → {stats['last_date']} ({stats['total']} notes)",
     ]
+    if completion and completion["has_entry"]:
+        if completion["completed_by"]:
+            lines.append("✅ Confirmed complete by Aardra")
+        else:
+            lines.append("⬜ Awaiting Aardra's confirmation")
     if streaks["missed_count"]:
         shown = ", ".join(streaks["missed_days"][-5:])
         extra = streaks["missed_count"] - 5
@@ -250,6 +362,8 @@ def main() -> None:
 
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_voice))
+    app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_call))
+    app.add_handler(CallbackQueryHandler(mark_complete_callback, pattern="^done$"))
     app.add_error_handler(error_handler)
 
     if GROUP_CHAT_ID is not None:

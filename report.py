@@ -8,12 +8,6 @@ LINE = "──────────────────"
 
 def format_report(transcription: dict, analysis: dict) -> str:
     text = (transcription.get("text") or "").strip()
-    wpm = analysis["wpm"]
-    fillers = analysis["fillers"]
-    pauses = analysis["pauses"]
-    clarity = analysis["clarity"]
-    pace = analysis["pace_consistency"]
-    duration = analysis["duration"]
 
     preview = text[:120] + ("…" if len(text) > 120 else "")
     if not preview:
@@ -24,6 +18,36 @@ def format_report(transcription: dict, analysis: dict) -> str:
         LINE,
         f"📝 {preview}",
         "",
+        *_metrics_block(analysis),
+    ]
+    return "\n".join(parts)
+
+
+def format_call_report(labeled_segments: list, analysis: dict) -> str:
+    """Format a 2-speaker call: labeled transcript + owner-only metrics."""
+    parts = [
+        "📞 Call Analysis",
+        LINE,
+        "🧑 You vs 👩 Aardra — metrics below reflect your speech only.",
+        "",
+        "💬 Transcript",
+        _labeled_transcript(labeled_segments),
+        "",
+        *_metrics_block(analysis),
+    ]
+    return "\n".join(parts)
+
+
+def _metrics_block(analysis: dict) -> list:
+    """Shared Core Metrics / Pace / Top Issues lines used by both reports."""
+    wpm = analysis["wpm"]
+    fillers = analysis["fillers"]
+    pauses = analysis["pauses"]
+    clarity = analysis["clarity"]
+    pace = analysis["pace_consistency"]
+    duration = analysis["duration"]
+
+    return [
         "📊 Core Metrics",
         f"- WPM: {wpm['average']:.0f} {_wpm_emoji(wpm['flag'])} — pace: {pace['label']}",
         f"- Duration: {duration:.0f}s",
@@ -39,7 +63,27 @@ def format_report(transcription: dict, analysis: dict) -> str:
         "💡 Top Issues",
         _top_issues(analysis),
     ]
-    return "\n".join(parts)
+
+
+def _labeled_transcript(labeled_segments: list) -> str:
+    """Render diarized segments as turns, collapsing consecutive same-speaker runs."""
+    if not labeled_segments:
+        return "(no speech detected)"
+
+    labels = {"owner": "🧑 You", "other": "👩 Aardra"}
+    turns = []  # (speaker, [text, ...])
+    for seg in labeled_segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = seg["speaker"]
+        if turns and turns[-1][0] == speaker:
+            turns[-1][1].append(text)
+        else:
+            turns.append((speaker, [text]))
+
+    lines = [f"{labels.get(sp, sp)}: {' '.join(chunks)}" for sp, chunks in turns]
+    return "\n".join(lines) if lines else "(no speech detected)"
 
 
 def _wpm_emoji(flag: str) -> str:

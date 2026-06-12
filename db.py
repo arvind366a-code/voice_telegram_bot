@@ -62,10 +62,27 @@ async def init_db() -> None:
             )
             """
         )
+        # Idempotent migrations for existing deployments (CREATE IF NOT EXISTS
+        # above won't add columns to a pre-existing table).
+        for ddl in (
+            "ALTER TABLE analyses ADD COLUMN source TEXT",
+            "ALTER TABLE analyses ADD COLUMN completed_by INTEGER",
+            "ALTER TABLE analyses ADD COLUMN completed_at TEXT",
+        ):
+            try:
+                await client.execute(ddl)
+            except Exception:
+                pass  # column already exists
 
 
-async def save_analysis(user_id: int, chat_id: int, analysis: dict, transcription: dict) -> None:
-    """Flatten an analysis dict and insert one row."""
+async def save_analysis(
+    user_id: int, chat_id: int, analysis: dict, transcription: dict, source: str = "voice"
+) -> None:
+    """Flatten an analysis dict and insert one row.
+
+    ``source`` records which flow produced the row: "voice" (solo note) or
+    "call" (2-speaker recording).
+    """
     wpm = analysis["wpm"]
     fillers = analysis["fillers"]
     pauses = analysis["pauses"]
@@ -77,8 +94,8 @@ async def save_analysis(user_id: int, chat_id: int, analysis: dict, transcriptio
                 created_at, created_date_ist, user_id, chat_id, duration,
                 word_count, avg_wpm, wpm_flag, filler_count, filler_pct,
                 pause_short, pause_medium, pause_long, total_pause_time,
-                clarity, pace_std, pace_label, transcript
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                clarity, pace_std, pace_label, transcript, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 datetime.now(timezone.utc).isoformat(),
@@ -99,8 +116,48 @@ async def save_analysis(user_id: int, chat_id: int, analysis: dict, transcriptio
                 analysis["pace_consistency"]["std_dev"],
                 analysis["pace_consistency"]["label"],
                 (transcription.get("text") or "").strip(),
+                source,
             ],
         )
+
+
+async def mark_today_complete(owner_id: int, reviewer_id: int) -> bool:
+    """Mark today's (IST) entries for ``owner_id`` as confirmed by the reviewer.
+
+    Returns True if at least one row was updated (i.e. there was an entry today).
+    """
+    async with _client() as client:
+        rs = await client.execute(
+            """
+            UPDATE analyses
+            SET completed_by = ?, completed_at = ?
+            WHERE user_id = ? AND created_date_ist = ?
+            """,
+            [reviewer_id, datetime.now(timezone.utc).isoformat(), owner_id, _today_ist()],
+        )
+        return bool(getattr(rs, "rows_affected", 0))
+
+
+async def completion_status_today(owner_id: int) -> dict:
+    """Today's (IST) entry + confirmation status for ``owner_id``.
+
+    Returns {"has_entry": bool, "completed_by": int | None}.
+    """
+    async with _client() as client:
+        rs = await client.execute(
+            """
+            SELECT MAX(completed_by) FROM analyses
+            WHERE user_id = ? AND created_date_ist = ?
+            """,
+            [owner_id, _today_ist()],
+        )
+        count_rs = await client.execute(
+            "SELECT COUNT(*) FROM analyses WHERE user_id = ? AND created_date_ist = ?",
+            [owner_id, _today_ist()],
+        )
+    has_entry = bool(count_rs.rows and int(count_rs.rows[0][0]) > 0)
+    completed_by = rs.rows[0][0] if rs.rows else None
+    return {"has_entry": has_entry, "completed_by": completed_by}
 
 
 async def has_done_today(user_id: int) -> bool:
